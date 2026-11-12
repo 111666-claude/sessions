@@ -9,6 +9,7 @@ import (
 	"encoding/gob"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -93,7 +94,7 @@ func (s *Session) Store() Store {
 
 // Registry -------------------------------------------------------------------
 
-// sessionInfo stores a session tracked by the registry.
+// sessionInfo describes a session registered with the registry.
 type sessionInfo struct {
 	s *Session
 	e error
@@ -121,40 +122,108 @@ func GetRegistry(r *http.Request) *Registry {
 }
 
 // Registry stores sessions used during a request.
+//
+// A Registry is safe for concurrent use: Get and Save may be called from
+// multiple goroutines for the same request. Access to the registry state is
+// serialized by mu.
+//
+// Sessions themselves are not synchronized; callers that share a *Session
+// between goroutines must coordinate access to its Values map.
 type Registry struct {
 	request  *http.Request
 	sessions map[string]sessionInfo
+	// mu guards sessions and the per-session store field.
+	mu sync.Mutex
 }
 
 // Get registers and returns a session for the given name and session store.
 //
 // It returns a new session if there are no sessions registered for the name.
+//
+// Registration is first-wins: if two goroutines race to create the same
+// session, every caller observes the session that was registered first. This
+// guarantees a single *Session per name without holding the registry lock
+// while store.New runs, which would deadlock stores that call back into the
+// registry.
 func (s *Registry) Get(store Store, name string) (session *Session, err error) {
 	if !isCookieNameValid(name) {
 		return nil, fmt.Errorf("sessions: invalid character in cookie name: %s", name)
 	}
-	if info, ok := s.sessions[name]; ok {
-		session, err = info.s, info.e
-	} else {
-		session, err = store.New(s.request, name)
-		session.name = name
-		s.sessions[name] = sessionInfo{s: session, e: err}
+
+	s.mu.Lock()
+	if s.sessions == nil {
+		s.sessions = make(map[string]sessionInfo)
 	}
-	session.store = store
-	return
+	if info, ok := s.sessions[name]; ok {
+		// Re-associate the cached session with the store, as the previous
+		// implementation did. This happens under the lock so concurrent
+		// Gets on the same name do not race on the field.
+		if info.s != nil {
+			info.s.store = store
+		}
+		s.mu.Unlock()
+		return info.s, info.e
+	}
+	s.mu.Unlock()
+
+	// store.New runs without the lock: custom stores may call back into the
+	// registry, and a slow decode must not block unrelated registrations.
+	session, err = store.New(s.request, name)
+	if session == nil && err == nil {
+		// The Store contract requires a non-nil session so that callers can
+		// always use the result; do not hand a nil back to the caller.
+		err = fmt.Errorf("sessions: store returned a nil session for %q", name)
+	}
+	if session != nil {
+		session.name = name
+		session.store = store
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.sessions[name]; ok {
+		// Another goroutine registered first; return its session so all
+		// callers share one instance.
+		if existing.s != nil {
+			existing.s.store = store
+		}
+		return existing.s, existing.e
+	}
+	s.sessions[name] = sessionInfo{s: session, e: err}
+	return session, err
 }
 
 // Save saves all sessions registered for the current request.
 func (s *Registry) Save(w http.ResponseWriter) error {
-	var errMulti MultiError
+	// Take a snapshot while holding the lock, then release it before
+	// touching any store. Holding the lock for the whole save could deadlock
+	// a store that itself calls back into the registry, and the session
+	// pointers are stable once registered.
+	s.mu.Lock()
+	type namedSession struct {
+		name    string
+		session *Session
+		store   Store
+	}
+	privateSessions := make([]namedSession, 0, len(s.sessions))
 	for name, info := range s.sessions {
-		session := info.s
-		if session.store == nil {
+		var store Store
+		if info.s != nil {
+			store = info.s.store
+		}
+		privateSessions = append(privateSessions, namedSession{name: name, session: info.s, store: store})
+	}
+	s.mu.Unlock()
+
+	var errMulti MultiError
+	for _, item := range privateSessions {
+		session := item.session
+		if session == nil || item.store == nil {
 			errMulti = append(errMulti, fmt.Errorf(
-				"sessions: missing store for session %q", name))
-		} else if err := session.store.Save(s.request, w, session); err != nil {
+				"sessions: missing store for session %q", item.name))
+		} else if err := item.store.Save(s.request, w, session); err != nil {
 			errMulti = append(errMulti, fmt.Errorf(
-				"sessions: error saving session %q -- %v", name, err))
+				"sessions: error saving session %q -- %v", item.name, err))
 		}
 	}
 	if errMulti != nil {
